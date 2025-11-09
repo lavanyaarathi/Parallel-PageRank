@@ -6,9 +6,9 @@ LDFLAGS = -lm
 # Target executable
 TARGET = pagerank_mpi
 
-# Source files
-SOURCES = pagerank_mpi.c
-HEADERS = pagerank_mpi.h
+# Source files for CSR implementation
+SOURCES = pagerank_mpi.c csr_graph.c
+HEADERS = pagerank_mpi.h csr_graph.h
 OBJECTS = $(SOURCES:.c=.o)
 
 # Default target

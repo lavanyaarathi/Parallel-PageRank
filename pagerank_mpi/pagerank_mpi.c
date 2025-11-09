@@ -1,5 +1,5 @@
 /********************************************************************/
-/*    Pagerank project - MPI Distributed version                    */
+/*    Pagerank project - MPI Distributed version (CSR)              */
 /*    *based on Cleve Moler's matlab implementation               */
 /*                                                                  */
 /*    Implemented for distributed memory parallelism using MPI     */
@@ -7,6 +7,12 @@
 
 /******************** Includes - Defines ****************/
 #include "pagerank_mpi.h"
+#include "csr_graph.h"
+#ifdef _WIN32
+#ifndef __USE_MINGW_ANSI_STDIO
+#define __USE_MINGW_ANSI_STDIO 1
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -33,117 +39,6 @@ double *global_p_t1;
 MPI_Datatype mpi_node_type;
 
 /******************** Function Implementations ****************/
-
-/***** Read graph connections from txt file *****/
-void Read_from_txt_file(char* filename, int rank, int size)
-{
-    FILE *fid;
-    int from_idx, to_idx;
-    char line[1000];
-    
-    // Calculate local partition range
-    int nodes_per_proc = N / size;
-    int remainder = N % size;
-    int local_start = rank * nodes_per_proc + (rank < remainder ? rank : remainder);
-    int local_end = local_start + nodes_per_proc + (rank < remainder ? 1 : 0);
-    
-    // Allocate memory for local nodes
-    Nodes = (Node*) malloc((local_end - local_start) * sizeof(Node));
-    for (int i = 0; i < (local_end - local_start); i++) {
-        Nodes[i].con_size = 0;
-        Nodes[i].To_id = (int*) malloc(sizeof(int));
-    }
-    
-    // Only rank 0 reads the file and distributes data
-    if (rank == 0) {
-        fid = fopen(filename, "r");
-        if (fid == NULL) {
-            printf("Error opening data file\n");
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        
-        // First pass: count connections for each node
-        int *global_con_sizes = (int*) calloc(N, sizeof(int));
-        while (fgets(line, sizeof(line), fid)) {
-            if (strncmp(line, "#", 1) != 0) {
-                if (sscanf(line, "%d\t%d\n", &from_idx, &to_idx) == 2) {
-                    global_con_sizes[from_idx]++;
-                }
-            }
-        }
-        rewind(fid);
-        
-        // Allocate global node structures
-        Node *global_nodes = (Node*) malloc(N * sizeof(Node));
-        for (int i = 0; i < N; i++) {
-            global_nodes[i].con_size = 0;
-            global_nodes[i].To_id = (int*) malloc(global_con_sizes[i] * sizeof(int));
-        }
-        
-        // Second pass: read actual connections
-        while (fgets(line, sizeof(line), fid)) {
-            if (strncmp(line, "#", 1) != 0) {
-                if (sscanf(line, "%d\t%d\n", &from_idx, &to_idx) == 2) {
-                    int temp_size = global_nodes[from_idx].con_size;
-                    global_nodes[from_idx].To_id[temp_size] = to_idx;
-                    global_nodes[from_idx].con_size++;
-                }
-            }
-        }
-        fclose(fid);
-        
-        // Distribute data to other processes
-        for (int dest = 1; dest < size; dest++) {
-            int dest_start = dest * nodes_per_proc + (dest < remainder ? dest : remainder);
-            int dest_end = dest_start + nodes_per_proc + (dest < remainder ? 1 : 0);
-            int dest_size = dest_end - dest_start;
-            
-            for (int i = 0; i < dest_size; i++) {
-                int global_idx = dest_start + i;
-                MPI_Send(&global_nodes[global_idx].con_size, 1, MPI_INT, dest, 0, MPI_COMM_WORLD);
-                if (global_nodes[global_idx].con_size > 0) {
-                    MPI_Send(global_nodes[global_idx].To_id, global_nodes[global_idx].con_size, MPI_INT, dest, 1, MPI_COMM_WORLD);
-                }
-            }
-        }
-        
-        // Copy local data for rank 0
-        for (int i = 0; i < (local_end - local_start); i++) {
-            int global_idx = local_start + i;
-            Nodes[i].con_size = global_nodes[global_idx].con_size;
-            free(Nodes[i].To_id);
-            if (Nodes[i].con_size > 0) {
-                Nodes[i].To_id = (int*) malloc(Nodes[i].con_size * sizeof(int));
-                memcpy(Nodes[i].To_id, global_nodes[global_idx].To_id, Nodes[i].con_size * sizeof(int));
-            } else {
-                Nodes[i].To_id = NULL;
-            }
-        }
-        
-        // Cleanup global data
-        for (int i = 0; i < N; i++) {
-            free(global_nodes[i].To_id);
-        }
-        free(global_nodes);
-        free(global_con_sizes);
-        
-    } else {
-        // Receive data from rank 0
-        for (int i = 0; i < (local_end - local_start); i++) {
-            MPI_Recv(&Nodes[i].con_size, 1, MPI_INT, 0, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            free(Nodes[i].To_id);
-            if (Nodes[i].con_size > 0) {
-                Nodes[i].To_id = (int*) malloc(Nodes[i].con_size * sizeof(int));
-                MPI_Recv(Nodes[i].To_id, Nodes[i].con_size, MPI_INT, 0, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            } else {
-                Nodes[i].To_id = NULL;
-            }
-        }
-    }
-    
-    printf("Rank %d: Local nodes %d to %d, total local nodes: %d\n", 
-           rank, local_start, local_end-1, local_end - local_start);
-}
 
 /***** Create P and E with equal probability *****/
 void Random_P_E(int local_start, int local_end)
@@ -233,99 +128,242 @@ double Compute_Global_Sum(double local_sum, int rank, int size)
     return global_sum;
 }
 
-/***** Distributed PageRank algorithm *****/
-void Distributed_PageRank(int rank, int size, int local_start, int local_end)
+/***** Distributed PageRank algorithm using CSR *****/
+void Distributed_PageRank_csr(int rank, int size, int local_start, int local_end, const CSRGraph *graph)
 {
     int iterations = 0;
     double max_error = 1.0;
     int local_size = local_end - local_start;
-    
-    // Allocate global array for rank gathering
-    if (rank == 0) {
-        global_p_t1 = (double*) malloc(N * sizeof(double));
-    }
-    
-    printf("Rank %d: Starting PageRank algorithm\n", rank);
-    
-    while (max_error > threshold)
-    {
-        double local_sum = 0.0;
-        double local_max_error = -1.0;
-        
-        // Exchange rank values using non-blocking communication
-        Exchange_Ranks_Nonblocking(rank, size, local_start, local_end);
-        
-        // Update local nodes
-        for (int i = 0; i < local_size; i++)
-        {
-            Nodes[i].p_t0 = Nodes[i].p_t1;
-            Nodes[i].p_t1 = 0.0;
+
+    double *p_t0_global = (double *)malloc(N * sizeof(double));
+    double *p_t1_local = (double *)calloc(local_size, sizeof(double));
+
+    while (max_error > threshold) {
+        // Gather all local p_t1 values to form global p_t0
+        double *local_p_t1 = (double *)malloc(local_size * sizeof(double));
+        for (int i = 0; i < local_size; i++) {
+            local_p_t1[i] = Nodes[i].p_t1;
         }
         
-        // Compute contributions
-        for (int i = 0; i < local_size; i++)
-        {
-            int global_node_id = local_start + i;
-            
-            if (Nodes[i].con_size != 0)
-            {
-                // Distribute rank to connected nodes
-                for (int j = 0; j < Nodes[i].con_size; j++)
-                {
-                    int target_node = Nodes[i].To_id[j];
-                    // Find which process owns this target node
-                    int target_proc = target_node / (N / size);
-                    if (target_proc >= size) target_proc = size - 1;
-                    
-                    // Add contribution to target node (using global array)
-                    if (rank == target_proc) {
-                        int local_target_idx = target_node - (target_proc * (N / size) + (target_proc < (N % size) ? target_proc : (N % size)));
-                        Nodes[local_target_idx].p_t1 += Nodes[i].p_t0 / Nodes[i].con_size;
+        // Calculate displacements and counts for each process
+        int *recvcounts = (int *)malloc(size * sizeof(int));
+        int *displs = (int *)malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            int proc_nodes = N / size;
+            int proc_remainder = N % size;
+            recvcounts[i] = proc_nodes + (i < proc_remainder ? 1 : 0);
+            displs[i] = (i == 0) ? 0 : displs[i-1] + recvcounts[i-1];
+        }
+        
+        // Gather all local PageRank values to all processes
+        MPI_Allgatherv(local_p_t1, local_size, MPI_DOUBLE, 
+                      p_t0_global, recvcounts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
+        
+        free(local_p_t1);
+        free(recvcounts);
+        free(displs);
+
+        // Compute dangling node sum in parallel
+        double local_dangling_sum = 0.0;
+        for (int i = local_start; i < local_end; i++) {
+            if (graph->row_ptr[i+1] == graph->row_ptr[i]) {
+                local_dangling_sum += p_t0_global[i];
+            }
+        }
+        double dangling_sum;
+        MPI_Allreduce(&local_dangling_sum, &dangling_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+        // Optimized CSR matrix-vector multiplication
+        // For each node j, distribute its PageRank to its neighbors
+        for (int j = 0; j < N; j++) {
+            int out_degree = graph->row_ptr[j+1] - graph->row_ptr[j];
+            if (out_degree > 0) {
+                double contribution = p_t0_global[j] / out_degree;
+                // For each neighbor of j
+                for (int k = graph->row_ptr[j]; k < graph->row_ptr[j+1]; k++) {
+                    int neighbor = graph->col_ind[k];
+                    // Check if this neighbor is in our local partition
+                    if (neighbor >= local_start && neighbor < local_end) {
+                        int local_idx = neighbor - local_start;
+                        p_t1_local[local_idx] += contribution;
                     }
                 }
             }
-            else
-            {
-                // Node with no outgoing connections contributes to all
-                local_sum += Nodes[i].p_t0 / N;
+        }
+
+        for (int i = 0; i < local_size; i++) {
+            Nodes[i].p_t1 = d * (p_t1_local[i] + dangling_sum / N) + (1.0 - d) / N;
+        }
+        
+        // Reset p_t1_local for next iteration
+        memset(p_t1_local, 0, local_size * sizeof(double));
+
+        double local_max_error = 0.0;
+        double local_l1_norm = 0.0;
+        for (int i = 0; i < local_size; i++) {
+            double error = fabs(Nodes[i].p_t1 - p_t0_global[local_start + i]);
+            local_l1_norm += error;
+            if (error > local_max_error) {
+                local_max_error = error;
+            }
+        }
+
+        double global_l1_norm;
+        MPI_Allreduce(&local_max_error, &max_error, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_l1_norm, &global_l1_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+        if (rank == 0) {
+            printf("Iteration %d, Max Error: %f, L1 Norm: %f\n", iterations, max_error, global_l1_norm);
+        }
+        iterations++;
+        
+        // Use L1 norm for convergence check (more robust)
+        if (global_l1_norm < threshold) {
+            if (rank == 0) {
+                printf("Converged based on L1 norm: %f < %f\n", global_l1_norm, threshold);
+            }
+            break;
+        }
+    }
+
+    free(p_t0_global);
+    free(p_t1_local);
+}
+
+/***** Block-based PageRank with periodic synchronization *****/
+void Distributed_PageRank_Block(int rank, int size, int local_start, int local_end, const CSRGraph *graph, int sync_interval)
+{
+    int iterations = 0;
+    double max_error = 1.0;
+    int local_size = local_end - local_start;
+
+    double *p_t0_global = (double *)malloc(N * sizeof(double));
+    double *p_t1_local = (double *)calloc(local_size, sizeof(double));
+    double *p_t0_local = (double *)malloc(local_size * sizeof(double));
+
+    // Initialize local p_t0 from global
+    for (int i = 0; i < local_size; i++) {
+        p_t0_local[i] = Nodes[i].p_t1;
+    }
+
+    while (max_error > threshold) {
+        // Perform local iterations without synchronization
+        for (int local_iter = 0; local_iter < sync_interval; local_iter++) {
+            // Local block computation
+            for (int i = 0; i < local_size; i++) {
+                p_t1_local[i] = 0.0;
+            }
+            
+            // Compute contributions from nodes in our local block
+            for (int j = local_start; j < local_end; j++) {
+                int out_degree = graph->row_ptr[j+1] - graph->row_ptr[j];
+                if (out_degree > 0) {
+                    int local_j = j - local_start;
+                    double contribution = p_t0_local[local_j] / out_degree;
+                    for (int k = graph->row_ptr[j]; k < graph->row_ptr[j+1]; k++) {
+                        int neighbor = graph->col_ind[k];
+                        if (neighbor >= local_start && neighbor < local_end) {
+                            int local_idx = neighbor - local_start;
+                            p_t1_local[local_idx] += contribution;
+                        }
+                    }
+                }
+            }
+            
+            // Update local PageRank values
+            for (int i = 0; i < local_size; i++) {
+                p_t0_local[i] = d * p_t1_local[i] + (1.0 - d) / N;
+                p_t1_local[i] = 0.0; // Reset for next iteration
             }
         }
         
-        // Compute global sum
-        double global_sum = Compute_Global_Sum(local_sum, rank, size);
+        // Synchronize: gather all local values
+        double *local_p_t1 = (double *)malloc(local_size * sizeof(double));
+        for (int i = 0; i < local_size; i++) {
+            local_p_t1[i] = p_t0_local[i];
+        }
         
-        // Update probabilities and compute local max error
-        for (int i = 0; i < local_size; i++)
-        {
-            Nodes[i].p_t1 = d * (Nodes[i].p_t1 + global_sum) + (1 - d) * Nodes[i].e;
-            
-            double error = fabs(Nodes[i].p_t1 - Nodes[i].p_t0);
+        int *recvcounts = (int *)malloc(size * sizeof(int));
+        int *displs = (int *)malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            int proc_nodes = N / size;
+            int proc_remainder = N % size;
+            recvcounts[i] = proc_nodes + (i < proc_remainder ? 1 : 0);
+            displs[i] = (i == 0) ? 0 : displs[i-1] + recvcounts[i-1];
+        }
+        
+        MPI_Allgatherv(local_p_t1, local_size, MPI_DOUBLE, 
+                      p_t0_global, recvcounts, displs, MPI_DOUBLE, MPI_COMM_WORLD);
+        
+        free(local_p_t1);
+        free(recvcounts);
+        free(displs);
+        
+        // Compute dangling sum in parallel
+        double local_dangling_sum = 0.0;
+        for (int i = local_start; i < local_end; i++) {
+            if (graph->row_ptr[i+1] == graph->row_ptr[i]) {
+                local_dangling_sum += p_t0_global[i];
+            }
+        }
+        double dangling_sum;
+        MPI_Allreduce(&local_dangling_sum, &dangling_sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+        
+        // Update with contributions from all blocks
+        for (int j = 0; j < N; j++) {
+            int out_degree = graph->row_ptr[j+1] - graph->row_ptr[j];
+            if (out_degree > 0) {
+                double contribution = p_t0_global[j] / out_degree;
+                for (int k = graph->row_ptr[j]; k < graph->row_ptr[j+1]; k++) {
+                    int neighbor = graph->col_ind[k];
+                    if (neighbor >= local_start && neighbor < local_end) {
+                        int local_idx = neighbor - local_start;
+                        p_t1_local[local_idx] += contribution;
+                    }
+                }
+            }
+        }
+        
+        // Final update with dangling nodes
+        for (int i = 0; i < local_size; i++) {
+            Nodes[i].p_t1 = d * (p_t1_local[i] + dangling_sum / N) + (1.0 - d) / N;
+            p_t0_local[i] = Nodes[i].p_t1;
+            p_t1_local[i] = 0.0;
+        }
+        
+        // Compute convergence metrics
+        double local_max_error = 0.0;
+        double local_l1_norm = 0.0;
+        for (int i = 0; i < local_size; i++) {
+            double error = fabs(Nodes[i].p_t1 - p_t0_global[local_start + i]);
+            local_l1_norm += error;
             if (error > local_max_error) {
                 local_max_error = error;
             }
         }
         
-        // Compute global max error
-        max_error = Compute_Global_Max_Error(local_max_error, rank, size);
+        double global_l1_norm;
+        MPI_Allreduce(&local_max_error, &max_error, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        MPI_Allreduce(&local_l1_norm, &global_l1_norm, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         
         if (rank == 0) {
-            printf("Iteration %d: Max Error = %f\n", iterations + 1, max_error);
+            printf("Iteration %d, Max Error: %f, L1 Norm: %f\n", iterations, max_error, global_l1_norm);
         }
-        
         iterations++;
         
-        // Safety check to prevent infinite loops
-        if (iterations > 1000) {
-            if (rank == 0) printf("Warning: Maximum iterations reached\n");
+        if (global_l1_norm < threshold) {
+            if (rank == 0) {
+                printf("Converged based on L1 norm: %f < %f\n", global_l1_norm, threshold);
+            }
             break;
         }
     }
     
-    if (rank == 0) {
-        printf("Total iterations: %d\n", iterations);
-        free(global_p_t1);
-    }
+    free(p_t0_global);
+    free(p_t1_local);
+    free(p_t0_local);
 }
+
 
 /***** Main function *****/
 int main(int argc, char** argv)
@@ -355,15 +393,34 @@ int main(int argc, char** argv)
     N = atoi(argv[2]);
     threshold = atof(argv[3]);
     d = atof(argv[4]);
+
+    CSRGraph graph;
+    if (rank == 0) {
+        read_csr_graph(filename, &graph);
+        N = graph.num_nodes;
+    }
+
+    // Broadcast graph dimensions
+    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&graph.num_edges, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Allocate memory on other processes
+    if (rank != 0) {
+        graph.row_ptr = (int *)malloc((N + 1) * sizeof(int));
+        graph.col_ind = (int *)malloc(graph.num_edges * sizeof(int));
+    }
+
+    // Broadcast CSR arrays
+    MPI_Bcast(graph.row_ptr, N + 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(graph.col_ind, graph.num_edges, MPI_INT, 0, MPI_COMM_WORLD);
     
     // Calculate local partition
     int nodes_per_proc = N / size;
     int remainder = N % size;
     int local_start = rank * nodes_per_proc + (rank < remainder ? rank : remainder);
     int local_end = local_start + nodes_per_proc + (rank < remainder ? 1 : 0);
-    
-    // Read graph data
-    Read_from_txt_file(filename, rank, size);
+
+    Nodes = (Node*) malloc((local_end - local_start) * sizeof(Node));
     
     // Initialize probabilities
     Random_P_E(local_start, local_end);
@@ -379,7 +436,7 @@ int main(int argc, char** argv)
     gettimeofday(&start, NULL);
     
     // Run distributed PageRank
-    Distributed_PageRank(rank, size, local_start, local_end);
+    Distributed_PageRank_csr(rank, size, local_start, local_end, &graph);
     
     gettimeofday(&end, NULL);
     
@@ -391,13 +448,8 @@ int main(int argc, char** argv)
     }
     
     // Cleanup
-    int local_size = local_end - local_start;
-    for (int i = 0; i < local_size; i++) {
-        if (Nodes[i].To_id != NULL) {
-            free(Nodes[i].To_id);
-        }
-    }
     free(Nodes);
+    free_csr_graph(&graph);
     
     // Finalize MPI
     MPI_Finalize();

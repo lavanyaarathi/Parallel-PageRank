@@ -1,31 +1,36 @@
-/******************** Structs ********************/
+#ifndef PAGERANK_MPI_H
+#define PAGERANK_MPI_H
 
-/***** Struct for timestamps *****/
-struct timeval start,end;
+#include <mpi.h>
+#include "csr_graph.h"
 
-/***** Struct used for Nodes data *****/
+/******************** Structs - Defines ********************/
 
-typedef struct
-{
-  double p_t0;
-  double p_t1;
-  double e;
-  int *To_id;
-  int con_size;
-}Node;
+// Struct for a single node
+typedef struct {
+    double p_t0; // PageRank at time t
+    double p_t1; // PageRank at time t+1
+    double e;    // Dangling node contribution
+} Node;
 
-/***** Struct for communication buffers *****/
-typedef struct
-{
-  int *node_ids;
-  double *rank_values;
-  int count;
-} CommBuffer;
+/******************** Function Prototypes ********************/
 
-/***** Function declarations *****/
-void Read_from_txt_file(char* filename, int rank, int size);
+// PageRank algorithm
+void Distributed_PageRank_csr(int rank, int size, int local_start, int local_end, const CSRGraph *graph);
+
+// Block-based PageRank with periodic synchronization
+void Distributed_PageRank_Block(int rank, int size, int local_start, int local_end, const CSRGraph *graph, int sync_interval);
+
+// Initialize probabilities
 void Random_P_E(int local_start, int local_end);
-void Distributed_PageRank(int rank, int size, int local_start, int local_end);
+
+// Exchange ranks between processes
 void Exchange_Ranks_Nonblocking(int rank, int size, int local_start, int local_end);
+
+// Compute global max error
 double Compute_Global_Max_Error(double local_max_error, int rank, int size);
+
+// Compute global sum
 double Compute_Global_Sum(double local_sum, int rank, int size);
+
+#endif // PAGERANK_MPI_H

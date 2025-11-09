@@ -1,40 +1,79 @@
 @echo off
-REM Build script for MPI PageRank on Windows
+setlocal enabledelayedexpansion
 
 echo Building MPI PageRank implementation...
-
-REM Check if mpicc is available
-where mpicc >nul 2>nul
-if %errorlevel% neq 0 (
-    echo Error: mpicc not found. Please ensure MPI is installed and in PATH.
-    echo You may need to install Microsoft MPI or Intel MPI.
-    exit /b 1
-)
 
 REM Clean previous build
 if exist pagerank_mpi.exe del pagerank_mpi.exe
 if exist pagerank_mpi.o del pagerank_mpi.o
+if exist csr_graph.o del csr_graph.o
 
-REM Compile
+REM Check MPI installation
+set "MPI_INC=C:\Program Files (x86)\Microsoft SDKs\MPI\Include"
+set "MPI_LIB=C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64"
+
+if not exist "%MPI_INC%\mpi.h" (
+    echo ERROR: MPI installation not found!
+    exit /b 1
+)
+
+echo Found Microsoft MPI installation
+
+REM Check Windows SDK
+set "SDK_VER=10.0.19041.0"
+set "SDK_INC=C:\Program Files (x86)\Windows Kits\10\Include\%SDK_VER%\shared"
+
+if not exist "%SDK_INC%\sal.h" (
+    set "SDK_VER=10.0.22621.0"
+    set "SDK_INC=C:\Program Files (x86)\Windows Kits\10\Include\%SDK_VER%\shared"
+    if not exist "%SDK_INC%\sal.h" (
+        set "SDK_VER=10.0.18362.0"
+        set "SDK_INC=C:\Program Files (x86)\Windows Kits\10\Include\%SDK_VER%\shared"
+        if not exist "%SDK_INC%\sal.h" (
+            echo ERROR: Windows SDK not found!
+            exit /b 1
+        )
+    )
+)
+
+echo Found Windows SDK version %SDK_VER%
+
+REM Use MSYS2 GCC if available
+set "GCC_CMD=C:\msys64\mingw64\bin\gcc.exe"
+if not exist "!GCC_CMD!" (
+    set "GCC_CMD=gcc"
+)
+
+echo Using GCC: !GCC_CMD!
+echo.
+
+REM Compile pagerank_mpi.c
 echo Compiling pagerank_mpi.c...
-gcc -I"C:\Program Files (x86)\Microsoft SDKs\MPI\Include" -Wall -O3 -std=c99 -c pagerank_mpi.c -o pagerank_mpi.o
+"!GCC_CMD!" -I"%MPI_INC%" -I"%SDK_INC%" -D__USE_MINGW_ANSI_STDIO=1 -Wall -O3 -std=c99 -c pagerank_mpi.c -o pagerank_mpi.o
+if errorlevel 1 (
+    echo ERROR: Compilation of pagerank_mpi.c failed!
+    exit /b 1
+)
 
-if %errorlevel% neq 0 (
-    echo Compilation failed!
+REM Compile csr_graph.c
+echo Compiling csr_graph.c...
+"!GCC_CMD!" -I"%MPI_INC%" -I"%SDK_INC%" -D__USE_MINGW_ANSI_STDIO=1 -Wall -O3 -std=c99 -c csr_graph.c -o csr_graph.o
+if errorlevel 1 (
+    echo ERROR: Compilation of csr_graph.c failed!
     exit /b 1
 )
 
 REM Link
 echo Linking...
-gcc pagerank_mpi.o -L"C:\Program Files (x86)\Microsoft SDKs\MPI\Lib\x64" -lmsmpi -lm -o pagerank_mpi.exe
-if %errorlevel% neq 0 (
-    Linking failed!
+"!GCC_CMD!" pagerank_mpi.o csr_graph.o -L"%MPI_LIB%" -lmsmpi -lm -o pagerank_mpi.exe
+if errorlevel 1 (
+    echo ERROR: Linking failed!
     exit /b 1
 )
 
+echo.
 echo Build successful!
 echo.
-echo To run the program:
-echo   mpirun -np 4 pagerank_mpi.exe web-Google.txt 1000 0.0001 0.85
+echo To run: mpiexec -n 4 pagerank_mpi.exe small_graph.txt 4 0.0001 0.85
 echo.
-echo Note: You need to have a graph file (e.g., web-Google.txt) in the current directory
+
